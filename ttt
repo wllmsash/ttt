@@ -1,0 +1,253 @@
+#!/usr/bin/env python3
+
+import argparse
+import json
+import subprocess
+import sys
+
+min_python_version = (3, 10)
+if not sys.version_info >= min_python_version:
+  # Python translates newlines to the system default os.linesep when newline=None, so writing \n here is equivalent to
+  # writing os.linesep.
+  sys.stderr.write(f'Python version must be {sys.version_info[0]}.{sys.version_info[1]} or greater\n')
+  # Flush immediately to enable line buffering on stderr.
+  sys.stderr.flush()
+  sys.exit(1)
+
+# Inherit from argparse.RawDescriptionHelpFormatter to control our own newlines.
+class HelpFormatter(argparse.RawDescriptionHelpFormatter):
+  def _format_action(self, action):
+    # Supress the options section.
+    return ''
+
+def main():
+  parser = argparse.ArgumentParser(
+    usage=argparse.SUPPRESS,
+    description=r'''
+%(prog)s - Transform and filter text matching a type predicate.
+
+USAGE:
+
+  $ %(prog)s [options] [-- <command> [args]]
+
+  Lines matching the constructed type predicate are transformed with the provided command. If a line doesn't match the
+  predicate or if no command is provided it is written back to stdout.
+  Each provided type option (e.g. --json) enables matching for lines of that type. Multiple type options combine to
+  match any of the provided options. If no type options are provided the --all type option is automatically added,
+  matching all lines.
+
+  Input is read from stdin. Writes to stdout and stderr are line buffered.
+
+OPTIONS:
+
+  -h, --help          Print the help text.
+
+  General options:
+
+  -c, --complement    The complement (negation) of the type predicate is used instead.
+  -f, --filter        Unmatched lines are filtered out.
+      --strip         Matched lines have their leading and trailing whitespace (including newlines) removed before
+                      being transformed or written back to stdout.
+      --strip-trailing-newline
+                      Matched lines have their trailing newlines removed before being transformed or written back to
+                      stdout.
+
+  Type options:
+
+  -a, --all           Match all lines.
+  -n, --none          Match no lines.
+  -j, --json          Match valid JSON lines.
+''',
+    epilog=r'''
+EXAMPLES:
+
+  $ %(prog)s
+  $ %(prog)s --complement
+  $ %(prog)s --all
+  $ %(prog)s --none
+
+    Print each line untransformed.
+
+    - No type options is equivalent to passing the --all type option. All lines are matched, but since there is no
+      command each line is printed untransformed.
+    - The --complement option with no other type options is equivalent to passing the --none type option, the complement
+      of the default --all type option. No lines are matched so each line is printed untransformed.
+    - The --all type option is equivalent to passing no type options, covered above.
+    - The --none type option is equivalent to passing the --complement type option, covered above.
+
+  $ %(prog)s -- <command> [args]
+
+    Run a command on each line.
+
+    - The -- option marks the end of the option arguments and all following arguments are used as the transform command.
+    - The command runs on matched lines, in this case all lines.
+
+    This is equivalent to:
+
+    $ xargs -d'\n' -I{} sh -c 'printf '\''{}\n'\'' | <command> [args]'
+    $ parallel -j1 'printf '\''{}\n'\'' | <command> [args]'
+    $ parallel -j1 -N1 --pipe '<command> [args]'
+
+    Since all writes to stdout and stderr are line buffered this can be used as a drop in replacement for:
+
+    $ stdbuf -oL <command> [args]
+    $ unbuffer -p <command> [args]
+
+  $ %(prog)s --json -- jq -c ". + { ts: $(date +%%s) }" | %(prog)s --complement --json -- sed "s/^/[$(date +%%s)] /"
+
+    Add { ..., "ts": <unix_timestamp> } to each JSON line and prepend "[<unix_timestamp] " to each non-JSON line.
+
+    The first invocation in the pipeline transforms the JSON lines.
+
+    - The --json type option matches JSON lines.
+    - The `jq -c ". + { ts: $(date +%%s) }"` command uses the jq program to add a timestamp field to each JSON object.
+
+    The second invocation in the pipeline transforms the non-JSON lines.
+
+    - The --complement option and --json type option matches non-JSON lines.
+    - The `sed "s/^/[$(date +%%s)] /"` command uses the sed program to prepend the timestamp in brackets to each text
+      line.
+
+  $ %(prog)s --filter --json -- jq -c '.ts'
+
+    Filter out all non-JSON lines and extract a timestamp field from each JSON line.
+
+    - The --json type option matches JSON lines.
+    - The --filter option filters out unmatched lines, in this case non-JSON lines.
+    - The `jq -c '.ts'` command uses the jq program to print the 'ts' timestamp field from each JSON line.
+
+  $ %(prog)s --strip-trailing-newline -- wc -c
+
+    Count the number of characters in each line, not including the newline.
+
+    - The --strip-trailing-newline option removes the trailing newline character from each line.
+    - The `wc -c` command uses the wc program to print the number of characters in each line.
+
+    This is equivalent to:
+
+    $ %(prog)s -- sh -c 'tr -d '\''\n'\'' | wc -c'
+
+  $ %(prog)s --strip -- sed 's/$/!/'
+
+    Strip whitespace from each line and append the '!' character.
+
+    - The --strip option removes leading and trailing whitespace, including the newline character from each line.
+    - The `sed 's/$/!/'` command uses the sed program to append '!' to each line.
+
+    This is equivalent to:
+
+    $ { while IFS= read -r line; do printf '%%s' "$line" | sed 's/^[[:blank:]]*//;s/[[:blank:]]*$//' | tr -d '\n' | sed 's/$/!/'; done; }
+
+    To replace the trailing newline after the transformation:
+
+    $ %(prog)s --strip -- sh -c 'sed '\''s/$/!\n/'\'''
+''',
+    allow_abbrev=False,
+    formatter_class=HelpFormatter,
+  )
+
+  parser.add_argument('-c', '--complement',
+    action='store_true',
+  )
+  parser.add_argument('-f', '--filter',
+    action='store_true',
+  )
+  parser.add_argument('--strip',
+    action='store_true',
+  )
+  parser.add_argument('--strip-trailing-newline',
+    action='store_true',
+  )
+
+  parser.add_argument('-a', '--all',
+    dest='type_predicates',
+    action='append_const',
+    const='all',
+  )
+  parser.add_argument('-n', '--none',
+    dest='type_predicates',
+    action='append_const',
+    const='none',
+  )
+  parser.add_argument('-j', '--json',
+    dest='type_predicates',
+    action='append_const',
+    const='json',
+  )
+
+  options = sys.argv[1:]
+  command = None
+  try:
+    index = options.index('--')
+    options_copy = options.copy()
+    options = options_copy[:index]
+    command = options_copy[index + 1:] or None
+  except ValueError:
+    pass
+
+  args = parser.parse_args(options)
+  if not args.type_predicates:
+    args.type_predicates = ['all']
+
+  def strip_line(line):
+    if args.strip:
+      return line.strip()
+    elif args.strip_trailing_newline:
+      # Python translates newlines from the system default os.linesep when newline=None, so removing \n here is
+      # equivalent to removing os.linesep.
+      return line.rstrip('\n')
+    else:
+      return line
+
+  while True:
+    if not (line := sys.stdin.readline()):
+      sys.exit(0)
+
+    # Test if the line is matched. If the --all type predicate is present don't check any other predicates. Otherwise
+    # check each type predicate, stopping if the line is matched.
+    line_is_matched = 'all' in args.type_predicates
+    if not line_is_matched:
+      for allowed_type in args.type_predicates:
+        match allowed_type:
+          case 'all':
+            line_is_matched = True
+          case 'none':
+            pass
+          case 'json':
+            try:
+              json.loads(line)
+              line_is_matched = True
+            except ValueError:
+              pass
+
+        if line_is_matched:
+          break
+
+    if args.complement:
+      line_is_matched = not line_is_matched
+
+    if line_is_matched:
+      if command:
+        # Set bufsize=1 to enable line buffering on stdout.
+        subprocess.run(command,
+          text=True,
+          bufsize=1,
+          input=strip_line(line),
+        )
+      else:
+        sys.stdout.write(strip_line(line))
+        # Flush immediately to enable line buffering on stdout.
+        sys.stdout.flush()
+    else:
+      if not args.filter:
+        sys.stdout.write(line)
+        # Flush immediately to enable line buffering on stdout.
+        sys.stdout.flush()
+      else:
+        pass
+
+try:
+  main()
+except KeyboardInterrupt:
+  sys.exit(130)
+
